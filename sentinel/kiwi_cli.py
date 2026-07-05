@@ -1,6 +1,8 @@
 import os
 import subprocess
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 from rich.console import Console
@@ -11,6 +13,7 @@ from rich.table import Table
 from sentinel.cognee_client import CogneeClient, CogneeError
 from sentinel.config import load_settings
 from sentinel.ingest import process_report
+from sentinel.lifecycle import confirm
 from sentinel.reviewer import fallback_review, build_review
 
 try:
@@ -28,51 +31,111 @@ except ImportError:
 console = Console()
 
 
-def get_llm_client():
+STATE_FILE = "kiwi_session_state.json"
+FLAKY_FILE = "kiwi_flaky_state.json"
+LLM_PROVIDERS = ("anthropic", "gemini", "openai")
+_ENV_KEY_NAMES = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "openai": "OPENAI_API_KEY",
+}
+_PLACEHOLDER_KEYS = {
+    "anthropic": "your_anthropic_key_here",
+    "gemini": "your_gemini_key_here",
+    "openai": "your_openai_key_here",
+}
+
+
+def _read_state() -> dict:
     import json
-    state_file = "kiwi_session_state.json"
-    provider = None
-    model = None
-    api_key = None
-    if os.path.exists(state_file):
+    if os.path.exists(STATE_FILE):
         try:
-            with open(state_file, "r") as f:
-                state = json.load(f)
-            if state.get("is_logged_in"):
-                provider = state.get("llm_provider", "").lower() or None
-                model = state.get("llm_model")
-                # NOTE: state["api_key"] is Cognee's API key; LLM keys should come from env (or a dedicated field).
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
         except Exception:
-            pass
+            return {}
+    return {}
 
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
-    gemini_key = os.environ.get("GEMINI_API_KEY")
-    openai_key = os.environ.get("OPENAI_API_KEY")
 
-    if provider == "anthropic" and anthropic_key and anthropic_key != "your_anthropic_key_here":
-        api_key = anthropic_key
-    elif provider == "gemini" and gemini_key and gemini_key != "your_gemini_key_here":
-        api_key = gemini_key
-    elif provider == "openai" and openai_key and openai_key != "your_openai_key_here":
-        api_key = openai_key
-    elif not provider:
-        if anthropic_key and anthropic_key != "your_anthropic_key_here":
-            provider, api_key = "anthropic", anthropic_key
-        elif gemini_key and gemini_key != "your_gemini_key_here":
-            provider, api_key = "gemini", gemini_key
-        elif openai_key and openai_key != "your_openai_key_here":
-            provider, api_key = "openai", openai_key
+def _write_state(updates: dict) -> None:
+    import json
+    state = _read_state()
+    state.update(updates)
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def _read_flaky() -> dict:
+    import json
+    if os.path.exists(FLAKY_FILE):
+        try:
+            with open(FLAKY_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _bump_flaky(test_names) -> None:
+    """Increment the persisted failure counter for each failing test name."""
+    import json
+    if not test_names:
+        return
+    counts = _read_flaky()
+    for name in test_names:
+        counts[name] = counts.get(name, 0) + 1
+    with open(FLAKY_FILE, "w") as f:
+        json.dump(counts, f, indent=2)
+
+
+def _provider_key(provider: str) -> str | None:
+    """Return a real API key for the provider from env, or None if unset/placeholder."""
+    key = os.environ.get(_ENV_KEY_NAMES.get(provider, ""), "")
+    if key and key != _PLACEHOLDER_KEYS.get(provider):
+        return key
+    return None
+
+
+def _state_model() -> str | None:
+    """The LLM model saved via /model, or None (ask_llm falls back to a default)."""
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return None
+    return _read_state().get("llm_model")
+
+
+def get_llm_client():
+    """Resolve the active LLM as a ``(provider, client, model)`` triple.
+
+    Provider preference is the one saved via /provider or /login in
+    ``kiwi_session_state.json``; otherwise the first provider that has a real
+    API key in the environment. ``model`` is the /model override or None
+    (callers fall back to a provider default). Returns ``(None, None, None)``
+    when nothing is configured.
+    """
+    provider = (_read_state().get("llm_provider") or "").lower()
+
+    if provider in LLM_PROVIDERS and _provider_key(provider):
+        api_key = _provider_key(provider)
+    else:
+        provider, api_key = "", None
+        for candidate in LLM_PROVIDERS:
+            key = _provider_key(candidate)
+            if key:
+                provider, api_key = candidate, key
+                break
+
+    model = _state_model()
     if not provider or not api_key:
         return None, None, None
 
     if provider == "anthropic" and anthropic:
-        return "anthropic", anthropic.Anthropic(api_key=api_key), model or "claude-opus-4-8"
-    elif provider == "gemini" and genai:
-        return "gemini", genai.Client(api_key=api_key), model or "gemini-3-flash-preview"
-    elif provider == "openai":
+        return "anthropic", anthropic.Anthropic(api_key=api_key), model
+    if provider == "gemini" and genai:
+        return "gemini", genai.Client(api_key=api_key), model
+    if provider == "openai":
         try:
             import openai
-            return "openai", openai.OpenAI(api_key=api_key), model or "gpt-5.5"
+            return "openai", openai.OpenAI(api_key=api_key), model
         except ImportError:
             pass
     return None, None, None
@@ -119,15 +182,80 @@ def ask_llm(provider, client, prompt: str, system_instruction: str = "You are Ki
     return "No LLM API key configured."
 
 
+def _print_config(settings):
+    state = _read_state()
+    table = Table(title="🥝 Kiwi Configuration", show_header=True, header_style="bold green")
+    table.add_column("Setting", style="cyan", no_wrap=True)
+    table.add_column("Value")
+    table.add_row("Cognee source", "session login" if state.get("is_logged_in") else ".env")
+    table.add_row("Cognee base URL", settings.base_url)
+    table.add_row("Cognee tenant", settings.tenant_id)
+    table.add_row("Cognee API key", (settings.api_key[:6] + "…") if settings.api_key else "—")
+    table.add_row("Dataset", settings.dataset)
+    table.add_row("LLM provider", state.get("llm_provider") or "(auto-detect)")
+    table.add_row("LLM model", state.get("llm_model") or "(provider default)")
+    keys = [p for p in LLM_PROVIDERS if _provider_key(p)]
+    table.add_row("LLM keys in env", ", ".join(keys) if keys else "none")
+    console.print(table)
+
+
+def _interactive_login(settings, input_func):
+    """Collect Cognee credentials + LLM provider, persist to the state file, and
+    return ``(new_settings, new_client)``. Returns ``(None, None)`` if cancelled."""
+    console.print(Panel.fit(
+        "🔐 [bold]Kiwi login[/bold] — press Enter to keep the shown default.",
+        border_style="cyan",
+    ))
+
+    def prompt(label, default="", secret=False):
+        shown = ("•" * 6) if (secret and default) else default
+        suffix = f" [{shown}]" if shown else ""
+        return input_func(f"{label}{suffix}: ").strip() or default
+
+    base_url = prompt("Cognee base URL", settings.base_url)
+    api_key = prompt("Cognee API key", settings.api_key, secret=True)
+    tenant_id = prompt("Cognee tenant ID", settings.tenant_id)
+    if not (base_url and api_key and tenant_id):
+        console.print("[bold red]Login cancelled — Cognee base URL, API key and tenant are all required.[/bold red]")
+        return None, None
+
+    provider = prompt("LLM provider (anthropic/gemini/openai)",
+                      _read_state().get("llm_provider") or "anthropic").lower()
+    if provider not in LLM_PROVIDERS:
+        console.print(f"[yellow]Unknown provider '{provider}' — leaving LLM provider on auto-detect.[/yellow]")
+        provider = ""
+    model = prompt("LLM model (blank = provider default)", _read_state().get("llm_model") or "")
+
+    _write_state({
+        "is_logged_in": True,
+        "base_url": base_url,
+        "api_key": api_key,
+        "tenant_id": tenant_id,
+        "llm_provider": provider,
+        "llm_model": model or None,
+    })
+    new_settings = load_settings()
+    return new_settings, CogneeClient(new_settings)
+
+
 def print_help():
     table = Table(title="🥝 Kiwi Commands", show_header=True, header_style="bold green")
     table.add_column("Command", style="cyan", no_wrap=True)
     table.add_column("Description")
+    table.add_row("/login", "Interactive credentials gate — set Cognee + LLM config.")
+    table.add_row("/provider [name]", "Show or switch the active LLM provider.")
+    table.add_row("/model [name]", "Show or set the provider-specific model.")
+    table.add_row("/config", "Print the active Cognee + LLM configuration.")
     table.add_row("/recall <query>", "Query Cognee memory directly.")
     table.add_row("/remember <text>", "Save a custom fact/incident to Cognee memory.")
     table.add_row("/review [xml_path]", "Ingest JUnit XML report, recall matches, and suggest fixes.")
     table.add_row("/test", "Run test suite (pytest), auto-ingest failures, and review them.")
+    table.add_row("/resolve <summary>", "Record a fix for the last failing test (bridges to memory).")
+    table.add_row("/flaky [test]", "Show recorded failure counts per test.")
+    table.add_row("/history <test>", "Recall a test's historical failures from memory.")
+    table.add_row("/session", "Show this session's activity log.")
     table.add_row("/forget", "Clear the Kiwi dataset in Cognee memory.")
+    table.add_row("/clear", "Clear the screen.")
     table.add_row("/help", "Show this help table.")
     table.add_row("/exit or /quit", "Exit Kiwi.")
     console.print(table)
@@ -141,6 +269,12 @@ def run_session(client, settings, input_func=input):
         border_style="green"
     ))
     console.print("Welcome to Kiwi! Type [cyan]/help[/cyan] for a list of commands.\n")
+
+    last_failures: list[str] = []
+    session_log: list[str] = []
+
+    def log(entry: str) -> None:
+        session_log.append(f"{datetime.now():%H:%M:%S}  {entry}")
 
     while True:
         try:
@@ -204,6 +338,9 @@ def run_session(client, settings, input_func=input):
                     continue
                 with console.status(f"[bold cyan]Processing test report '{xml_path}'...[/bold cyan]"):
                     results = process_report(xml_path, client=client, dataset=settings.dataset)
+                last_failures = [r.failure.test_name for r in results]
+                _bump_flaky(last_failures)
+                log(f"/review {xml_path}: {len(results)} failure(s)")
                 for r in results:
                     review = build_review(r)
                     console.print(Panel(Markdown(review), title=f"Review for {r.failure.test_name}", border_style="yellow"))
@@ -217,6 +354,9 @@ def run_session(client, settings, input_func=input):
                 if os.path.exists("junit_report.xml"):
                     with console.status("[bold cyan]Processing results and calling memory...[/bold cyan]"):
                         results = process_report("junit_report.xml", client=client, dataset=settings.dataset)
+                    last_failures = [r.failure.test_name for r in results]
+                    _bump_flaky(last_failures)
+                    log(f"/test: {len(results)} failure(s)")
                     for r in results:
                         review = build_review(r)
                         console.print(Panel(Markdown(review), title=f"Review for {r.failure.test_name}", border_style="yellow"))
@@ -231,6 +371,96 @@ def run_session(client, settings, input_func=input):
                     except CogneeError as exc:
                         console.print(f"[bold red]✗ Failed to clear dataset:[/bold red] {exc}")
 
+            elif cmd == "/config":
+                _print_config(settings)
+
+            elif cmd == "/clear":
+                console.clear()
+
+            elif cmd == "/provider":
+                name = arg.lower()
+                if not name:
+                    console.print(f"[cyan]Active LLM provider:[/cyan] {_read_state().get('llm_provider') or '(auto-detect)'}")
+                    console.print(f"Switch with e.g. [cyan]/provider anthropic[/cyan]. Options: {', '.join(LLM_PROVIDERS)}")
+                elif name in LLM_PROVIDERS:
+                    _write_state({"llm_provider": name})
+                    keyed = "[green]key found in env[/green]" if _provider_key(name) else "[yellow]no API key in env yet[/yellow]"
+                    console.print(f"[bold green]✓[/bold green] Provider set to [cyan]{name}[/cyan] ({keyed}).")
+                else:
+                    console.print(f"[bold red]Unknown provider '{name}'.[/bold red] Options: {', '.join(LLM_PROVIDERS)}")
+
+            elif cmd == "/model":
+                if not arg:
+                    console.print(f"[cyan]Active model:[/cyan] {_read_state().get('llm_model') or '(provider default)'}")
+                else:
+                    _write_state({"llm_model": arg})
+                    console.print(f"[bold green]✓[/bold green] Model set to [cyan]{arg}[/cyan].")
+
+            elif cmd == "/login":
+                new_settings, new_client = _interactive_login(settings, input_func)
+                if new_settings is not None:
+                    settings, client = new_settings, new_client
+                    console.print(f"[bold green]✓[/bold green] Logged in. Active Cognee dataset: [cyan]{settings.dataset}[/cyan]")
+
+            elif cmd == "/resolve":
+                if not arg:
+                    console.print("[bold yellow]Describe the fix.[/bold yellow] E.g. [cyan]/resolve added idempotency key[/cyan]")
+                elif not last_failures:
+                    console.print("[bold yellow]No recent failing test to resolve.[/bold yellow] Run [cyan]/test[/cyan] or [cyan]/review[/cyan] first.")
+                else:
+                    target = last_failures[-1]
+                    with console.status(f"[bold cyan]Recording resolution for '{target}' (improve)...[/bold cyan]"):
+                        try:
+                            confirm(client, test_name=target, resolution=arg,
+                                    run_id=f"kiwi-{int(time.time())}", dataset=settings.dataset)
+                            log(f"/resolve {target}: {arg}")
+                            console.print(f"[bold green]✓[/bold green] Resolution recorded for [cyan]{target}[/cyan] and bridged to permanent memory.")
+                        except CogneeError as exc:
+                            console.print(f"[bold red]✗ Failed to record resolution:[/bold red] {exc}")
+
+            elif cmd == "/flaky":
+                counts = _read_flaky()
+                if arg:
+                    console.print(f"[cyan]{arg}[/cyan]: {counts.get(arg, 0)} recorded failure(s)")
+                elif not counts:
+                    console.print("[bold yellow]No failures tracked yet.[/bold yellow] Run [cyan]/test[/cyan] or [cyan]/review[/cyan] first.")
+                else:
+                    table = Table(title="🥝 Flaky-Test Failure Counts", header_style="bold green")
+                    table.add_column("Test", style="cyan")
+                    table.add_column("Failures", justify="right")
+                    for name, cnt in sorted(counts.items(), key=lambda kv: kv[1], reverse=True):
+                        table.add_row(name, str(cnt))
+                    console.print(table)
+
+            elif cmd == "/history":
+                if not arg:
+                    console.print("[bold yellow]Specify a test name.[/bold yellow] E.g. [cyan]/history test_login[/cyan]")
+                else:
+                    query = f"List all historical failures and resolutions of the test '{arg}', with dates."
+                    hits = None
+                    with console.status(f"[bold cyan]Querying memory for '{arg}' history...[/bold cyan]"):
+                        try:
+                            hits = client.recall(query, dataset=settings.dataset)
+                        except CogneeError as exc:
+                            console.print(f"[bold red]✗ History lookup failed:[/bold red] {exc}")
+                    if hits:
+                        for idx, hit in enumerate(hits, 1):
+                            console.print(Panel(hit.get("text", ""), title=f"{arg} — history #{idx}", border_style="cyan"))
+                    elif hits is not None:
+                        console.print(f"[bold yellow]No history found for '{arg}'.[/bold yellow]")
+
+            elif cmd == "/session":
+                if not session_log:
+                    console.print("[bold yellow]No activity recorded in this session yet.[/bold yellow]")
+                else:
+                    table = Table(title="🥝 Session Activity", header_style="bold green")
+                    table.add_column("Time", style="dim", no_wrap=True)
+                    table.add_column("Event")
+                    for entry in session_log:
+                        ts, _, ev = entry.partition("  ")
+                        table.add_row(ts, ev)
+                    console.print(table)
+
             else:
                 console.print(f"[bold red]Unknown command: {cmd}[/bold red]. Type [cyan]/help[/cyan] for available commands.")
 
@@ -244,7 +474,7 @@ def run_session(client, settings, input_func=input):
                 except CogneeError as exc:
                     console.print(f"[bold yellow][WARNING] Failed to retrieve context from memory: {exc}[/bold yellow]")
 
-            provider, llm = get_llm_client()
+            provider, llm, model = get_llm_client()
             if not llm:
                 console.print("[bold yellow][WARNING] No LLM configured. Outputting memory recall only.[/bold yellow]")
                 if context_str:
@@ -268,7 +498,7 @@ def run_session(client, settings, input_func=input):
             )
             
             with console.status(f"[bold cyan]Asking {provider.capitalize()}...[/bold cyan]"):
-                ans = ask_llm(provider, llm, prompt, system_instruction)
+                ans = ask_llm(provider, llm, prompt, system_instruction, model=model)
             console.print(Panel(Markdown(ans), title="Kiwi Answer", border_style="green"))
 
 
