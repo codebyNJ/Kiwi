@@ -65,7 +65,7 @@ def test_kiwi_chat_query(mock_ask_llm, mock_get_llm, mock_client, mock_settings)
         return inputs.pop(0)
 
     mock_client.recall.return_value = [{"text": "observed customer billed twice"}]
-    mock_get_llm.return_value = ("gemini", MagicMock())
+    mock_get_llm.return_value = ("gemini", MagicMock(), None)
     mock_ask_llm.return_value = "Yes, due to retries."
 
     run_session(mock_client, mock_settings, input_func=mock_input)

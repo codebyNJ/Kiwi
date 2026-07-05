@@ -104,12 +104,13 @@ def _state_model() -> str | None:
 
 
 def get_llm_client():
-    """Resolve the active LLM as a ``(provider, client)`` pair.
+    """Resolve the active LLM as a ``(provider, client, model)`` triple.
 
     Provider preference is the one saved via /provider or /login in
     ``kiwi_session_state.json``; otherwise the first provider that has a real
-    API key in the environment. Returns ``(None, None)`` when nothing is
-    configured.
+    API key in the environment. ``model`` is the /model override or None
+    (callers fall back to a provider default). Returns ``(None, None, None)``
+    when nothing is configured.
     """
     provider = (_read_state().get("llm_provider") or "").lower()
 
@@ -123,20 +124,21 @@ def get_llm_client():
                 provider, api_key = candidate, key
                 break
 
+    model = _state_model()
     if not provider or not api_key:
-        return None, None
+        return None, None, None
 
     if provider == "anthropic" and anthropic:
-        return "anthropic", anthropic.Anthropic(api_key=api_key)
+        return "anthropic", anthropic.Anthropic(api_key=api_key), model
     if provider == "gemini" and genai:
-        return "gemini", genai.Client(api_key=api_key)
+        return "gemini", genai.Client(api_key=api_key), model
     if provider == "openai":
         try:
             import openai
-            return "openai", openai.OpenAI(api_key=api_key)
+            return "openai", openai.OpenAI(api_key=api_key), model
         except ImportError:
             pass
-    return None, None
+    return None, None, None
 
 
 def ask_llm(provider, client, prompt: str, system_instruction: str = "You are Kiwi, a helpful QA assistant.", model=None) -> str:
@@ -472,7 +474,7 @@ def run_session(client, settings, input_func=input):
                 except CogneeError as exc:
                     console.print(f"[bold yellow][WARNING] Failed to retrieve context from memory: {exc}[/bold yellow]")
 
-            provider, llm = get_llm_client()
+            provider, llm, model = get_llm_client()
             if not llm:
                 console.print("[bold yellow][WARNING] No LLM configured. Outputting memory recall only.[/bold yellow]")
                 if context_str:
@@ -496,7 +498,7 @@ def run_session(client, settings, input_func=input):
             )
             
             with console.status(f"[bold cyan]Asking {provider.capitalize()}...[/bold cyan]"):
-                ans = ask_llm(provider, llm, prompt, system_instruction, model=_state_model())
+                ans = ask_llm(provider, llm, prompt, system_instruction, model=model)
             console.print(Panel(Markdown(ans), title="Kiwi Answer", border_style="green"))
 
 
